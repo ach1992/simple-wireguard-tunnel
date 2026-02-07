@@ -100,13 +100,18 @@ suggest_free_tunnel_name() {
 # --- Multi-tunnel port helpers ---
 get_used_listen_ports() {
   ensure_dirs
+
   shopt -s nullglob
+  local files=("$WG_DIR"/*.conf)
+  shopt -u nullglob
+
+  ((${#files[@]} == 0)) && return 0
+
   awk -F'=' '
     /^[[:space:]]*ListenPort[[:space:]]*=/ {
       gsub(/[[:space:]]/, "", $2);
       if ($2 ~ /^[0-9]+$/) print $2
-    }' "$WG_DIR"/*.conf 2>/dev/null | sort -n | uniq
-  shopt -u nullglob
+    }' "${files[@]}" 2>/dev/null | sort -n | uniq
 }
 
 port_in_use() {
@@ -172,9 +177,11 @@ print_copy_block() {
 # returns 0 only if a block was actually pasted & parsed
 prompt_paste_copy_block() {
   COPY_BLOCK_DETECTED=0
-
+  
+  echo
   echo -e "${CYA}Paste COPY BLOCK now${NC} (press Enter to cancel)."
   echo -e "Finish paste by pressing ${WHT}Enter TWICE${NC} on empty lines."
+  echo
   local first; read -r -p "Paste the COPY BLOCK (or just Enter to cancel): " first || true
   [[ -z "${first:-}" ]] && return 1
 
