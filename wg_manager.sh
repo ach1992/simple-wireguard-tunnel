@@ -2,7 +2,8 @@
 set -Eeuo pipefail
 
 # ==================================================
-#  Simple WireGuard Tunnel Manager
+#  Simple WireGuard Tunnel Manager (v5 - FIXED)
+#  Repo: https://github.com/ach1992/simple-wireguard-tunnel
 # ==================================================
 
 APP_NAME="Simple WireGuard Tunnel"
@@ -11,6 +12,8 @@ REPO_URL="https://github.com/ach1992/simple-wireguard-tunnel"
 WG_DIR="/etc/wireguard"
 APP_CONF_DIR="/etc/simple-wireguard"
 SYSCTL_FILE="$APP_CONF_DIR/99-simple-wireguard.conf"
+IPFWD_PREV_FILE="$APP_CONF_DIR/ip_forward.prev"
+IPFWD_MARK_FILE="$APP_CONF_DIR/ip_forward.managed"
 
 RED="\033[0;31m"; GRN="\033[0;32m"; YEL="\033[0;33m"; BLU="\033[0;34m"
 MAG="\033[0;35m"; CYA="\033[0;36m"; WHT="\033[1;37m"; NC="\033[0m"
@@ -36,14 +39,20 @@ require_cmds() {
     have_cmd "$c" || missing+=("$c")
   done
   if ((${#missing[@]})); then
-    err "Missing required commands: ${missing[*]}"
-    err "Debian/Ubuntu: apt-get update && apt-get install -y wireguard-tools iproute2 iputils-ping"
+    if [[ "${missing[*]}" =~ "wg" ]] || [[ "${missing[*]}" =~ "wg-quick" ]]; then
+      err "Missing required commands: wireguard-tools"
+      err "Debian/Ubuntu: apt-get update && apt-get install -y wireguard-tools"
+    else
+      err "Missing required commands: ${missing[*]}"
+      err "Debian/Ubuntu: apt-get install -y iproute2 iputils-ping"
+    fi
     exit 1
   fi
 }
 
 ensure_dirs() { mkdir -p "$WG_DIR" "$APP_CONF_DIR"; }
 
+# --- Validation ---
 is_ipv4() {
   local ip="$1"
   [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
@@ -52,13 +61,15 @@ is_ipv4() {
     [[ "$o" =~ ^[0-9]+$ ]] && (( o >= 0 && o <= 255 )) || return 1
   done
 }
-is_ifname() { [[ "$1" =~ ^[a-zA-Z0-9_.-]{1,15}$ ]]; }   # wg0 هم مجاز شد
+is_ifname() { [[ "$1" =~ ^[a-zA-Z0-9_.-]{1,15}$ ]]; }  # wg0 هم مجاز
 is_wg_key() { [[ "$1" =~ ^[A-Za-z0-9+/]{43}=$ ]]; }
-is_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
+is_port()   { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
 
+# --- Network Helpers ---
 default_iface() { ip route 2>/dev/null | awk '/^default/{print $5; exit}'; }
 get_iface_ip() { ip -4 -o addr show dev "$1" 2>/dev/null | awk '{print $4}' | head -n1 | cut -d/ -f1; }
 
+# --- Tunnel & Service Naming ---
 conf_path_for() { echo "$WG_DIR/${1}.conf"; }
 service_for() { echo "wg-quick@${1}.service"; }
 tunnel_exists() { [[ -f "$(conf_path_for "$1")" ]]; }
@@ -72,6 +83,7 @@ find_first_free_wg_name() {
   done
 }
 
+# --- Pair Code & IP Generation ---
 generate_pair_code() { echo "10.$(( (RANDOM % 254) + 1 )).$(( (RANDOM % 254) + 1 ))"; }
 parse_pair_code() {
   [[ "$1" =~ ^10\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
@@ -90,6 +102,7 @@ recompute_tunnel_ips_from_pair() {
   fi
 }
 
+# --- COPY BLOCK ---
 print_copy_block() {
   local src_ip dst_ip src_pubkey dst_pubkey
   if [[ "${ROLE}" == "source" ]]; then
@@ -107,19 +120,18 @@ print_copy_block() {
   echo "SOURCE_PUBKEY=${src_pubkey}"
   echo "DEST_PUBKEY=${dst_pubkey}"
   echo "TUN_NAME=${TUN_NAME}"
-  echo "ENDPOINT_PORT=${LISTEN_PORT}"
+  echo "LISTEN_PORT=${LISTEN_PORT}"
   echo "MTU=${MTU}"
   echo "----- END_COPY_BLOCK -----"
 }
 
-# FIX: این تابع فقط وقتی واقعاً بلاک paste شد success می‌دهد
+# returns 0 only if a block was actually pasted
 prompt_paste_copy_block() {
   COPY_BLOCK_DETECTED=0
 
   echo -e "${CYA}Optional:${NC} Paste COPY BLOCK now (press Enter to skip)."
   echo -e "Finish paste by pressing ${WHT}Enter TWICE${NC} on empty lines."
-  local first
-  read -r -p "Paste the COPY BLOCK (or just Enter to skip): " first || true
+  local first; read -r -p "Paste the COPY BLOCK (or just Enter to skip): " first || true
   [[ -z "${first:-}" ]] && return 1
 
   COPY_BLOCK_DETECTED=1
@@ -135,36 +147,82 @@ prompt_paste_copy_block() {
     empty_count=0; lines+=("$line")
   done
 
+  # reset paste vars
+  PASTE_SOURCE_PUBLIC_IP=""; PASTE_DEST_PUBLIC_IP=""
+  PASTE_SOURCE_PUBKEY=""; PASTE_DEST_PUBKEY=""
+  PASTE_TUN_NAME=""; PASTE_LISTEN_PORT=""; PASTE_MTU=""; PASTE_PAIR_CODE=""
+
   for kv in "${lines[@]}"; do
     [[ "$kv" =~ ^[A-Z0-9_]+= ]] || continue
     local key="${kv%%=*}" val="${kv#*=}"
     case "$key" in
-      PAIR_CODE) PAIR_CODE="$val" ;;
+      PAIR_CODE)        PASTE_PAIR_CODE="$val" ;;
       SOURCE_PUBLIC_IP) PASTE_SOURCE_PUBLIC_IP="$val" ;;
       DEST_PUBLIC_IP)   PASTE_DEST_PUBLIC_IP="$val" ;;
       SOURCE_PUBKEY)    PASTE_SOURCE_PUBKEY="$val" ;;
       DEST_PUBKEY)      PASTE_DEST_PUBKEY="$val" ;;
-      TUN_NAME)         TUN_NAME="$val" ;;
-      ENDPOINT_PORT)    LISTEN_PORT="$val" ;;
-      MTU)              MTU="$val" ;;
+      TUN_NAME)         PASTE_TUN_NAME="$val" ;;
+      LISTEN_PORT)      PASTE_LISTEN_PORT="$val" ;;
+      MTU)              PASTE_MTU="$val" ;;
     esac
   done
 
-  [[ -n "${PAIR_CODE:-}" ]] && ! parse_pair_code "$PAIR_CODE" >/dev/null && { err "Pasted PAIR_CODE invalid."; return 1; }
+  [[ -n "${PASTE_PAIR_CODE:-}" ]] && ! parse_pair_code "$PASTE_PAIR_CODE" >/dev/null && { err "Pasted PAIR_CODE invalid."; return 1; }
   [[ -n "${PASTE_SOURCE_PUBLIC_IP:-}" ]] && ! is_ipv4 "$PASTE_SOURCE_PUBLIC_IP" && { err "Pasted SOURCE_PUBLIC_IP invalid."; return 1; }
   [[ -n "${PASTE_DEST_PUBLIC_IP:-}" ]] && ! is_ipv4 "$PASTE_DEST_PUBLIC_IP" && { err "Pasted DEST_PUBLIC_IP invalid."; return 1; }
   [[ -n "${PASTE_SOURCE_PUBKEY:-}" ]] && ! is_wg_key "$PASTE_SOURCE_PUBKEY" && { err "Pasted SOURCE_PUBKEY invalid."; return 1; }
   [[ -n "${PASTE_DEST_PUBKEY:-}" ]] && ! is_wg_key "$PASTE_DEST_PUBKEY" && { err "Pasted DEST_PUBKEY invalid."; return 1; }
-  [[ -n "${TUN_NAME:-}" ]] && ! is_ifname "$TUN_NAME" && { err "Pasted TUN_NAME invalid."; return 1; }
-  [[ -n "${LISTEN_PORT:-}" ]] && ! is_port "$LISTEN_PORT" && { err "Pasted ENDPOINT_PORT invalid."; return 1; }
-  [[ -n "${MTU:-}" ]] && ! [[ "$MTU" =~ ^[0-9]+$ ]] && { err "Pasted MTU must be numeric."; return 1; }
+  [[ -n "${PASTE_TUN_NAME:-}" ]] && ! is_ifname "$PASTE_TUN_NAME" && { err "Pasted TUN_NAME invalid."; return 1; }
+  [[ -n "${PASTE_LISTEN_PORT:-}" ]] && ! is_port "$PASTE_LISTEN_PORT" && { err "Pasted LISTEN_PORT invalid."; return 1; }
+  [[ -n "${PASTE_MTU:-}" ]] && ! [[ "$PASTE_MTU" =~ ^[0-9]+$ ]] && { err "Pasted MTU must be numeric."; return 1; }
 
   ok "COPY BLOCK parsed successfully."
   return 0
 }
 
+# --- Sysctl management (safe rollback) ---
+ipfwd_current() { sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "0"; }
+
+ensure_ip_forwarding_managed() {
+  ensure_dirs
+  # save prev only once
+  if [[ ! -f "$IPFWD_MARK_FILE" ]]; then
+    ipfwd_current > "$IPFWD_PREV_FILE" || true
+    echo "managed_by_simple_wg" > "$IPFWD_MARK_FILE"
+  fi
+
+  {
+    echo "# Simple WireGuard sysctl (persist) - generated"
+    echo "net.ipv4.ip_forward=1"
+  } >"$SYSCTL_FILE"
+  chmod 644 "$SYSCTL_FILE"
+  sysctl --system >/dev/null 2>&1 || true
+}
+
+restore_ip_forwarding_if_last_tunnel() {
+  ensure_dirs
+  local tunnels; tunnels="$(list_tunnels)"
+  if [[ -n "${tunnels:-}" ]]; then
+    return 0
+  fi
+
+  # only touch if we managed it
+  if [[ -f "$IPFWD_MARK_FILE" ]]; then
+    local prev="0"
+    [[ -f "$IPFWD_PREV_FILE" ]] && prev="$(cat "$IPFWD_PREV_FILE" 2>/dev/null || echo 0)"
+    rm -f "$SYSCTL_FILE" "$IPFWD_PREV_FILE" "$IPFWD_MARK_FILE" >/dev/null 2>&1 || true
+
+    # restore runtime (best-effort)
+    sysctl -w "net.ipv4.ip_forward=${prev}" >/dev/null 2>&1 || true
+    sysctl --system >/dev/null 2>&1 || true
+    ok "Restored net.ipv4.ip_forward=${prev} (no tunnels left)."
+  fi
+}
+
+# --- Config I/O ---
 read_meta() {
   local f; f="$(conf_path_for "$1")"; [[ -f "$f" ]] || return 1
+
   ROLE=$(sed -n 's/^# ROLE=\(.*\)/\1/p' "$f" | head -n1)
   PAIR_CODE=$(sed -n 's/^# PAIR_CODE=\(.*\)/\1/p' "$f" | head -n1)
   LOCAL_WAN_IP=$(sed -n 's/^# LOCAL_WAN_IP=\(.*\)/\1/p' "$f" | head -n1)
@@ -172,7 +230,6 @@ read_meta() {
   REMOTE_PUBKEY=$(sed -n 's/^# REMOTE_PUBKEY=\(.*\)/\1/p' "$f" | head -n1)
   TUN_NAME="$1"
 
-  # FIX: PrivateKey را از فایل می‌خوانیم (wg showconf برای فایل نیست)
   LOCAL_PRIVKEY=$(awk -F' = ' '/^[[:space:]]*PrivateKey[[:space:]]*=/{print $2; exit}' "$f" || true)
   [[ -n "${LOCAL_PRIVKEY:-}" ]] || { err "Could not read PrivateKey from $f"; return 1; }
   LOCAL_PUBKEY=$(echo "$LOCAL_PRIVKEY" | wg pubkey)
@@ -208,16 +265,20 @@ EOF
   chmod 600 "$f"
 }
 
+# --- Tunnel listing / selection ---
 list_tunnels() {
-  ensure_dirs; shopt -s nullglob
+  ensure_dirs
+  shopt -s nullglob
   for f in "$WG_DIR"/*.conf; do
-    base="$(basename "$f")"; echo "${base%.conf}"
+    base="$(basename "$f")"
+    echo "${base%.conf}"
   done
   shopt -u nullglob
 }
 
 choose_tunnel() {
-  local tunnels=(); while IFS= read -r t; do [[ -n "$t" ]] && tunnels+=("$t"); done < <(list_tunnels)
+  local tunnels=()
+  while IFS= read -r t; do [[ -n "$t" ]] && tunnels+=("$t"); done < <(list_tunnels)
   ((${#tunnels[@]} == 0)) && { err "No tunnels found."; return 1; }
   echo -e "${MAG}Available tunnels:${NC}"
   local i
@@ -227,22 +288,14 @@ choose_tunnel() {
     read -r -p "Select tunnel [1-${#tunnels[@]}] (Enter=cancel): " choice || true
     [[ -z "${choice:-}" ]] && return 1
     if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#tunnels[@]} )); then
-      SELECTED_TUN="${tunnels[$((choice-1))]}"; return 0
+      SELECTED_TUN="${tunnels[$((choice-1))]}"
+      return 0
     fi
     err "Invalid selection."
   done
 }
 
-write_sysctl_persist() {
-  ensure_dirs
-  {
-    echo "# Simple WireGuard sysctl (persist) - generated"
-    echo "net.ipv4.ip_forward=1"
-  } >"$SYSCTL_FILE"
-  chmod 644 "$SYSCTL_FILE"
-  sysctl --system >/dev/null 2>&1 || true
-}
-
+# --- Service Management ---
 enable_service() { systemctl enable "$(service_for "$1")" >/dev/null 2>&1 || true; }
 apply_now() { systemctl restart "$(service_for "$1")" >/dev/null 2>&1 || true; }
 stop_disable_service() {
@@ -250,10 +303,11 @@ stop_disable_service() {
   systemctl disable "$(service_for "$1")" >/dev/null 2>&1 || true
 }
 
+# --- Prompts ---
 prompt_role() {
   echo "Select server role:"
-  echo "  1) Source (Iran)"
-  echo "  2) Destination (Kharej)"
+  echo "  1) Iran (Source)"
+  echo "  2) Kharej (Destination)"
   local c
   while true; do
     read -r -p "Enter choice [1-2]: " c || true
@@ -263,6 +317,12 @@ prompt_role() {
       *) err "Invalid choice." ;;
     esac
   done
+}
+
+prompt_yesno() {
+  local prompt="$1" def="${2:-N}" ans
+  read -r -p "${prompt} [y/N]: " ans || true
+  [[ "${ans:-$def}" =~ ^([yY])$ ]]
 }
 
 prompt_tun_name_new() {
@@ -312,6 +372,37 @@ prompt_details_keep() {
   MTU="$inp"
 }
 
+prompt_remote_pubkey_keep() {
+  local inp
+  while true; do
+    read -r -p "Remote Peer Public Key [${REMOTE_PUBKEY:-}]: " inp || true
+    inp="${inp:-${REMOTE_PUBKEY:-}}"
+    is_wg_key "$inp" || { err "Invalid remote public key."; continue; }
+    REMOTE_PUBKEY="$inp"
+    return 0
+  done
+}
+
+show_summary_and_confirm() {
+  echo
+  echo -e "${MAG}===== Summary =====${NC}"
+  printf "%-18s %s\n" "Role:" "$ROLE"
+  printf "%-18s %s\n" "Tunnel name:" "$TUN_NAME"
+  printf "%-18s %s\n" "Pair code:" "$PAIR_CODE"
+  printf "%-18s %s\n" "Local WAN IP:" "$LOCAL_WAN_IP"
+  printf "%-18s %s\n" "Remote WAN IP:" "$REMOTE_WAN_IP"
+  printf "%-18s %s\n" "Local tun IP:" "$TUN_LOCAL_IP"
+  printf "%-18s %s\n" "Remote tun IP:" "$TUN_REMOTE_IP"
+  printf "%-18s %s\n" "Listen port:" "$LISTEN_PORT"
+  printf "%-18s %s\n" "MTU:" "$MTU"
+  echo
+  printf "%-18s %s\n" "Local pubkey:" "$LOCAL_PUBKEY"
+  printf "%-18s %s\n" "Remote pubkey:" "$REMOTE_PUBKEY"
+  echo
+  prompt_yesno "Proceed to create/apply this tunnel?"
+}
+
+# --- Actions ---
 do_generate_keypair() {
   log "Generating a new WireGuard keypair..."
   local privkey pubkey
@@ -330,29 +421,55 @@ do_create() {
   log "Creating NEW WireGuard tunnel..."
   echo
 
-  # Defaults
-  MTU="1420"; LISTEN_PORT="51820"; PAIR_CODE=""
-  LOCAL_WAN_IP=""; REMOTE_WAN_IP=""; LOCAL_PRIVKEY=""; LOCAL_PUBKEY=""
-  REMOTE_PUBKEY=""; PASTE_SOURCE_PUBLIC_IP=""; PASTE_DEST_PUBLIC_IP=""
-  PASTE_SOURCE_PUBKEY=""; PASTE_DEST_PUBKEY=""
-  COPY_BLOCK_DETECTED=0
-
-  if prompt_paste_copy_block; then
-    ROLE="destination"
-    log "COPY BLOCK detected. Assuming 'Destination' role."
-  else
-    prompt_role
-  fi
+  # always ask role first (per your request)
+  prompt_role
   echo
 
-  prompt_tun_name_new || return
+  # defaults
+  MTU="1420"; LISTEN_PORT="51820"; PAIR_CODE=""
+  LOCAL_WAN_IP=""; REMOTE_WAN_IP=""; LOCAL_PRIVKEY=""; LOCAL_PUBKEY=""
+  REMOTE_PUBKEY=""
+  COPY_BLOCK_DETECTED=0
 
-  if (( COPY_BLOCK_DETECTED )); then
-    # کاربر مقصد است: IP و کلید peer را از بلاک می‌گیرد
-    LOCAL_WAN_IP="${PASTE_DEST_PUBLIC_IP}"
-    REMOTE_WAN_IP="${PASTE_SOURCE_PUBLIC_IP}"
-    REMOTE_PUBKEY="${PASTE_SOURCE_PUBKEY}"
-    ok "Public IPs and Peer Key filled from COPY BLOCK."
+  if prompt_yesno "Do you have a COPY BLOCK from the other server?"; then
+    if prompt_paste_copy_block; then
+      # apply pasted values as defaults (still editable later)
+      [[ -n "${PASTE_TUN_NAME:-}" ]] && TUN_NAME="$PASTE_TUN_NAME"
+      [[ -n "${PASTE_LISTEN_PORT:-}" ]] && LISTEN_PORT="$PASTE_LISTEN_PORT"
+      [[ -n "${PASTE_MTU:-}" ]] && MTU="$PASTE_MTU"
+      [[ -n "${PASTE_PAIR_CODE:-}" ]] && PAIR_CODE="$PASTE_PAIR_CODE"
+
+      # map pasted info depending on our ROLE
+      if [[ "$ROLE" == "source" ]]; then
+        # we are Iran(Source): local = SOURCE_PUBLIC_IP, remote = DEST_PUBLIC_IP, remote pubkey = DEST_PUBKEY
+        [[ -n "${PASTE_SOURCE_PUBLIC_IP:-}" ]] && LOCAL_WAN_IP="$PASTE_SOURCE_PUBLIC_IP"
+        [[ -n "${PASTE_DEST_PUBLIC_IP:-}" ]] && REMOTE_WAN_IP="$PASTE_DEST_PUBLIC_IP"
+        [[ -n "${PASTE_DEST_PUBKEY:-}" ]] && REMOTE_PUBKEY="$PASTE_DEST_PUBKEY"
+      else
+        # we are Kharej(Destination): local = DEST_PUBLIC_IP, remote = SOURCE_PUBLIC_IP, remote pubkey = SOURCE_PUBKEY
+        [[ -n "${PASTE_DEST_PUBLIC_IP:-}" ]] && LOCAL_WAN_IP="$PASTE_DEST_PUBLIC_IP"
+        [[ -n "${PASTE_SOURCE_PUBLIC_IP:-}" ]] && REMOTE_WAN_IP="$PASTE_SOURCE_PUBLIC_IP"
+        [[ -n "${PASTE_SOURCE_PUBKEY:-}" ]] && REMOTE_PUBKEY="$PASTE_SOURCE_PUBKEY"
+      fi
+
+      ok "Defaults loaded from COPY BLOCK (you can edit them)."
+    else
+      warn "No block pasted. Continuing with manual input."
+    fi
+    echo
+  fi
+
+  # tunnel name (use pasted as default if present)
+  if [[ -z "${TUN_NAME:-}" ]]; then
+    prompt_tun_name_new || return
+  else
+    # validate + ensure not taken; allow editing
+    local inp
+    read -r -p "Tunnel interface name [${TUN_NAME}]: " inp || true
+    inp="${inp:-$TUN_NAME}"
+    is_ifname "$inp" || { err "Invalid interface name."; return 1; }
+    tunnel_exists "$inp" && { err "Tunnel name '${inp}' is already taken."; return 1; }
+    TUN_NAME="$inp"
   fi
 
   prompt_wan_ips_keep || return
@@ -365,15 +482,21 @@ do_create() {
   LOCAL_PUBKEY=$(echo "$LOCAL_PRIVKEY" | wg pubkey)
   ok "Local keys generated."
 
+  # remote pubkey (pasted or manual)
   if [[ -z "${REMOTE_PUBKEY:-}" ]]; then
-    warn "You need the Public Key of the other server (the peer)."
-    while ! is_wg_key "${REMOTE_PUBKEY:-}"; do
-      read -r -p "Enter the Remote Peer's Public Key: " REMOTE_PUBKEY || true
-    done
+    warn "Remote Peer Public Key not set. You must enter it."
+  fi
+  prompt_remote_pubkey_keep || return
+
+  recompute_tunnel_ips_from_pair || return
+
+  if ! show_summary_and_confirm; then
+    warn "Canceled."
+    return
   fi
 
   write_conf "$TUN_NAME"
-  write_sysctl_persist
+  ensure_ip_forwarding_managed
   enable_service "$TUN_NAME"
   apply_now "$TUN_NAME"
 
@@ -383,37 +506,69 @@ do_create() {
 }
 
 do_edit() {
-  choose_tunnel || return; local old_tun="$SELECTED_TUN"
+  choose_tunnel || return
+  local old_tun="$SELECTED_TUN"
   read_meta "$old_tun" || { err "Could not read config for $old_tun"; return; }
-  log "Editing tunnel: $old_tun"; warn "Press Enter to keep current values."; echo
+  log "Editing tunnel: $old_tun"
+  warn "Press Enter to keep current values."
+  echo
 
-  local r; echo "Current role: ${ROLE}"; read -r -p "Change role? (1=Source, 2=Dest, Enter=keep): " r || true
-  if [[ -n "${r:-}" ]]; then case "$r" in 1) ROLE="source";; 2) ROLE="destination";; esac; fi
+  local r
+  echo "Current role: ${ROLE}"
+  read -r -p "Change role? (1=Iran/Source, 2=Kharej/Dest, Enter=keep): " r || true
+  if [[ -n "${r:-}" ]]; then
+    case "$r" in 1) ROLE="source" ;; 2) ROLE="destination" ;; *) err "Invalid choice."; return ;;
+    esac
+  fi
 
-  prompt_tun_name_keep || return
+  local inp
+  read -r -p "Tunnel interface name [${TUN_NAME}]: " inp || true
+  inp="${inp:-$TUN_NAME}"
+  is_ifname "$inp" || { err "Invalid interface name."; return 1; }
+  if [[ "$inp" != "$old_tun" ]] && tunnel_exists "$inp"; then
+    err "Tunnel name '${inp}' is already taken."
+    return 1
+  fi
+  TUN_NAME="$inp"
+
   prompt_wan_ips_keep || return
   prompt_pair_code_keep || return
   recompute_tunnel_ips_from_pair || return
   prompt_details_keep || return
+  prompt_remote_pubkey_keep || return
 
-  local inp; read -r -p "Remote Peer Public Key [${REMOTE_PUBKEY}]: " inp || true; inp="${inp:-$REMOTE_PUBKEY}"
-  is_wg_key "$inp" || { err "Invalid remote public key."; return 1; }; REMOTE_PUBKEY="$inp"
-
+  # rename handling
   if [[ "$TUN_NAME" != "$old_tun" ]]; then
-    warn "Tunnel name changed: $old_tun -> $TUN_NAME"; stop_disable_service "$old_tun"
+    warn "Tunnel name changed: $old_tun -> $TUN_NAME"
+    stop_disable_service "$old_tun"
     rm -f "$(conf_path_for "$old_tun")" || true
   fi
 
-  write_conf "$TUN_NAME"; write_sysctl_persist; enable_service "$TUN_NAME"; apply_now "$TUN_NAME"
-  ok "Tunnel '${TUN_NAME}' updated and applied."; echo; show_info_one "$TUN_NAME"
+  if ! show_summary_and_confirm; then
+    warn "Canceled."
+    return
+  fi
+
+  write_conf "$TUN_NAME"
+  ensure_ip_forwarding_managed
+  enable_service "$TUN_NAME"
+  apply_now "$TUN_NAME"
+  ok "Tunnel '${TUN_NAME}' updated and applied."
+  echo
+  show_info_one "$TUN_NAME"
 }
 
 do_status_one() {
-  choose_tunnel || return; local tun="$SELECTED_TUN"
+  choose_tunnel || return
+  local tun="$SELECTED_TUN"
   read_meta "$tun" || { err "Could not read config for $tun"; return; }
   echo -e "${MAG}===== WireGuard Status: ${tun} =====${NC}"
-  echo -e "${WHT}Service:${NC}"; systemctl --no-pager --full status "$(service_for "$tun")" || true; echo
-  echo -e "${WHT}Interface & Peer:${NC}"; wg show "$tun" || warn "Interface '$tun' is not active."; echo
+  echo -e "${WHT}Service:${NC}"
+  systemctl --no-pager --full status "$(service_for "$tun")" || true
+  echo
+  echo -e "${WHT}Interface & Peer:${NC}"
+  wg show "$tun" || warn "Interface '$tun' is not active."
+  echo
   echo -e "${WHT}Connectivity:${NC} ping ${TUN_REMOTE_IP}"
   if ping -c 3 -W 2 "$TUN_REMOTE_IP" >/dev/null 2>&1; then
     ok "Ping successful. Tunnel is UP."
@@ -424,13 +579,17 @@ do_status_one() {
 
 do_status_all() {
   echo -e "${MAG}===== WireGuard Status: ALL TUNNELS =====${NC}"
-  local tunnels; tunnels=$(list_tunnels); [[ -z "$tunnels" ]] && { warn "No tunnels configured."; return; }
+  local tunnels; tunnels=$(list_tunnels)
+  [[ -z "${tunnels:-}" ]] && { warn "No tunnels configured."; return; }
   wg show all
 }
 
 show_info_one() {
   local tun_to_show="${1:-}"
-  if [[ -z "$tun_to_show" ]]; then choose_tunnel || return; tun_to_show="$SELECTED_TUN"; fi
+  if [[ -z "$tun_to_show" ]]; then
+    choose_tunnel || return
+    tun_to_show="$SELECTED_TUN"
+  fi
   read_meta "$tun_to_show" || { err "Could not read config for $tun_to_show"; return; }
 
   echo -e "${MAG}===== WireGuard Info: ${tun_to_show} =====${NC}"
@@ -453,12 +612,20 @@ show_info_one() {
 }
 
 do_delete() {
-  choose_tunnel || return; local tun="$SELECTED_TUN"
+  choose_tunnel || return
+  local tun="$SELECTED_TUN"
+
   warn "This will permanently delete tunnel '$tun' and its config file."
   local yn; read -r -p "Are you sure? [y/N]: " yn || true
   [[ ! "$yn" =~ ^([yY])$ ]] && { log "Canceled."; return; }
-  stop_disable_service "$tun"; rm -f "$(conf_path_for "$tun")" || true
+
+  stop_disable_service "$tun"
+  rm -f "$(conf_path_for "$tun")" || true
+
   ok "Deleted tunnel '$tun'."
+
+  # if that was last tunnel, rollback sysctl
+  restore_ip_forwarding_if_last_tunnel
 }
 
 banner() {
@@ -470,7 +637,8 @@ banner() {
 
 menu() {
   while true; do
-    clear || true; banner
+    clear || true
+    banner
     echo -e "${CYA}1)${NC} Create tunnel"
     echo -e "${CYA}2)${NC} Edit tunnel"
     echo -e "${CYA}3)${NC} Status (one tunnel)"
