@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # ==================================================
-#  Simple WireGuard Tunnel Manager (v7 - SAFE MULTI + HARD LOCKS)
+#  Simple WireGuard Tunnel Manager
 # ==================================================
 
 APP_NAME="Simple WireGuard Tunnel"
@@ -137,9 +137,15 @@ port_in_use() {
 }
 
 suggest_free_port() {
-  local start="${1:-51820}" p="$start"
+  local start
+  start="${1:-51820}"
+  local p="$start"
+
   while (( p <= 65535 )); do
-    if ! port_in_use "$p"; then echo "$p"; return 0; fi
+    if ! port_in_use "$p"; then
+      echo "$p"
+      return 0
+    fi
     ((p++))
   done
   return 1
@@ -419,6 +425,7 @@ prompt_mtu() {
 
 prompt_local_listen_port() {
   local inp suggested
+
   if [[ -z "${LOCAL_LISTEN_PORT:-}" ]]; then
     suggested="$(suggest_free_port 51820 || true)"
     LOCAL_LISTEN_PORT="${suggested:-51820}"
@@ -433,6 +440,7 @@ prompt_local_listen_port() {
 
     read -r -p "Local ListenPort [${LOCAL_LISTEN_PORT}]: " inp || true
     inp="${inp:-$LOCAL_LISTEN_PORT}"
+
     is_port "$inp" || { err "Invalid port."; continue; }
     if port_in_use "$inp"; then
       suggested="$(suggest_free_port "$inp" || true)"
@@ -440,6 +448,7 @@ prompt_local_listen_port() {
       [[ -n "$suggested" ]] && warn "Try: $suggested"
       continue
     fi
+
     LOCAL_LISTEN_PORT="$inp"
     break
   done
@@ -748,8 +757,8 @@ do_status_one() {
   local peer rx tx
   peer="$(wg show "$tun" peers 2>/dev/null | head -n1)"
   if [[ -n "${peer:-}" ]]; then
-    rx="$(wg show "$tun" transfer 2>/dev/null | awk -v p="$peer" '$1==p{print $2" "$3; exit}')"
-    tx="$(wg show "$tun" transfer 2>/dev/null | awk -v p="$peer" '$1==p{print $4" "$5; exit}')"
+    rx_b="$(wg show "$tun" transfer 2>/dev/null | awk -v p="$peer" '$1==p{print $2; exit}')"
+    tx_b="$(wg show "$tun" transfer 2>/dev/null | awk -v p="$peer" '$1==p{print $3; exit}')"
     echo "Transfer: RX=${rx:-0 B} | TX=${tx:-0 B}"
   else
     echo "Transfer: N/A"
