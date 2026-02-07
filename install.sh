@@ -33,6 +33,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
+script_dir() {
+  # This function is only safe to call when not running from a pipe.
+  local src="${BASH_SOURCE[0]}"
+  while [ -h "$src" ]; do
+    local dir; dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"; [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
 # --- Main Logic ---
 install_deps() {
   if have_cmd wg && have_cmd wg-quick; then
@@ -62,10 +72,24 @@ install_deps() {
 prepare_script() {
   mkdir -p "$TMP_DIR"
   
-  # Check if running from a pipe (like curl | bash)
-  # In this case, BASH_SOURCE is empty and we must download.
-  if [[ -z "${BASH_SOURCE[0]:-}" ]]; then
-    log "Installer is running from a pipe. Switching to online mode."
+  # Check if running from a file on disk. /dev/stdin is a pipe, not a file.
+  if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
+    # --- OFFLINE/LOCAL MODE ---
+    local local_manager_path
+    local_manager_path="$(script_dir)/${SCRIPT_NAME}"
+
+    if [[ -f "$local_manager_path" ]]; then
+      log "Local manager script found. Using offline mode."
+      cp -f "$local_manager_path" "${TMP_DIR}/${SCRIPT_NAME}"
+      return 0
+    else
+      err "Local manager script (${SCRIPT_NAME}) not found in the same directory."
+      err "Offline installation failed. Please place both install.sh and wg_manager.sh together."
+      exit 1
+    fi
+  else
+    # --- ONLINE MODE (from pipe) ---
+    log "Installer is running from a pipe. Using online mode."
     if ! have_cmd curl; then
       err "curl is required for online installation."
       exit 1
@@ -75,26 +99,11 @@ prepare_script() {
     ok "Downloaded ${SCRIPT_NAME} successfully."
     return 0
   fi
-
-  local script_path
-  script_path=$( cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P )
-  local local_manager_path="${script_path}/${SCRIPT_NAME}"
-
-  if [[ -f "$local_manager_path" ]]; then
-    log "Local manager script found at: ${local_manager_path}"
-    log "Using local ${SCRIPT_NAME} for installation (offline mode)."
-    cp -f "$local_manager_path" "${TMP_DIR}/${SCRIPT_NAME}"
-    return 0
-  else
-    err "Local manager script (${SCRIPT_NAME}) not found in the same directory."
-    err "Offline installation failed. Please place both install.sh and wg_manager.sh together."
-    exit 1
-  fi
 }
 
 install_script() {
-  if [[ ! -f "${TMP_DIR}/${SCRIPT_NAME}" ]]; then
-      err "Manager script not found in temp directory. Cannot proceed with installation."
+  if [[ ! -s "${TMP_DIR}/${SCRIPT_NAME}" ]]; then
+      err "Manager script is empty or not found. Cannot proceed with installation."
       exit 1
   fi
   install -m 0755 "${TMP_DIR}/${SCRIPT_NAME}" "${INSTALL_PATH}"
