@@ -4,12 +4,6 @@ set -Eeuo pipefail
 # ==================================================
 # Simple WireGuard Tunnel Installer
 # Repo: https://github.com/ach1992/simple-wireguard-tunnel
-#
-# Online usage:
-#   curl -fsSL https://.../install.sh | sudo bash
-#
-# Offline usage:
-#   sudo bash install.sh
 # ==================================================
 
 REPO_RAW_BASE="https://raw.githubusercontent.com/ach1992/simple-wireguard-tunnel/main"
