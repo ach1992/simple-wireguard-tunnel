@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # ==================================================
-#  Simple WireGuard Tunnel Manager (v4 - FIXED)
+#  Simple WireGuard Tunnel Manager
 # ==================================================
 
 APP_NAME="Simple WireGuard Tunnel"
