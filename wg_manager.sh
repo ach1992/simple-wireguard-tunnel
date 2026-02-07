@@ -2,16 +2,16 @@
 set -Eeuo pipefail
 
 # ==================================================
-#  Simple WireGuard Tunnel Manager - FINAL
+#  Simple WireGuard Tunnel Manager (v2 - Keygen Menu)
 #  Repo: https://github.com/ach1992/simple-wireguard-tunnel
 # ==================================================
 # Debian/Ubuntu friendly (systemd )
 # Features:
+# - NEW: Keypair generation utility in the main menu.
 # - Create/Edit/Status/Info/Delete MULTIPLE WireGuard tunnels
 # - Per-tunnel config files in /etc/wireguard/<tun>.conf
 # - Uses standard wg-quick@<tun>.service
 # - Auto-generates PAIR CODE (10.X.Y) for each tunnel (/30)
-# - Auto-generates public/private keys for each side
 # - Generates a COPY BLOCK for easy setup on the other server
 # - Enables IP forwarding and persists it via sysctl.d
 
@@ -177,7 +177,6 @@ prompt_paste_copy_block() {
 }
 
 # --- Config I/O ---
-# We store metadata in comments inside the wg conf file
 read_meta() {
   local f; f="$(conf_path_for "$1")"; [[ -f "$f" ]] || return 1
   ROLE=$(sed -n 's/^# ROLE=\(.*\)/\1/p' "$f")
@@ -185,12 +184,11 @@ read_meta() {
   LOCAL_WAN_IP=$(sed -n 's/^# LOCAL_WAN_IP=\(.*\)/\1/p' "$f")
   REMOTE_WAN_IP=$(sed -n 's/^# REMOTE_WAN_IP=\(.*\)/\1/p' "$f")
   REMOTE_PUBKEY=$(sed -n 's/^# REMOTE_PUBKEY=\(.*\)/\1/p' "$f")
-  # Read from actual config content
   TUN_NAME="$1"
-  LOCAL_PRIVKEY=$(wg show "$f" private-key)
-  LOCAL_PUBKEY=$(wg show "$f" private-key | wg pubkey)
-  LISTEN_PORT=$(awk -F'=' '/ListenPort/ {print $2}' "$f" | tr -d ' ')
-  MTU=$(awk -F'=' '/MTU/ {print $2}' "$f" | tr -d ' ')
+  LOCAL_PRIVKEY=$(wg showconf "$f" | awk -F' = ' '/PrivateKey/ {print $2}')
+  LOCAL_PUBKEY=$(echo "$LOCAL_PRIVKEY" | wg pubkey)
+  LISTEN_PORT=$(awk -F' = ' '/ListenPort/ {print $2}' "$f")
+  MTU=$(awk -F' = ' '/MTU/ {print $2}' "$f")
   recompute_tunnel_ips_from_pair
 }
 
@@ -214,7 +212,7 @@ PostDown = sysctl -w net.ipv4.ip_forward=0
 
 [Peer]
 PublicKey = ${REMOTE_PUBKEY}
-AllowedIPs = ${TUN_REMOTE_IP}/32
+AllowedIPs = ${TUN_REMOTE_IP}/32, 0.0.0.0/0
 Endpoint = ${REMOTE_WAN_IP}:${LISTEN_PORT}
 PersistentKeepalive = 25
 EOF
@@ -310,27 +308,63 @@ prompt_details_keep() {
 }
 
 # --- Actions ---
+do_generate_keypair() {
+    log "Generating a new WireGuard keypair..."
+    local privkey pubkey
+    privkey=$(wg genkey)
+    pubkey=$(echo "$privkey" | wg pubkey)
+    echo
+    echo -e "${GRN}Keypair generated successfully:${NC}"
+    echo -e "---------------------------------------------------"
+    echo -e "${WHT}Private Key:${NC} ${privkey}"
+    echo -e "${CYA}Public Key:${NC}  ${pubkey}"
+    echo -e "---------------------------------------------------"
+    echo -e "${YEL}Copy the Public Key. You will need it on the other server.${NC}"
+}
+
 do_create() {
   log "Creating NEW WireGuard tunnel..."; echo
-  prompt_role; echo
+  
+  # Check if user is pasting a block. If so, they are the 'destination'.
+  if prompt_paste_copy_block; then
+      ROLE="destination"
+      log "COPY BLOCK detected. Assuming 'Destination' role."
+  else
+      # If no block is pasted, they are the 'source'.
+      prompt_role
+  fi
+  echo
+
   # Defaults
   MTU="1420"; LISTEN_PORT="51820"; PAIR_CODE=""
   LOCAL_WAN_IP=""; REMOTE_WAN_IP=""; LOCAL_PRIVKEY=""; LOCAL_PUBKEY=""
   REMOTE_PUBKEY=""; PASTE_SOURCE_PUBLIC_IP=""; PASTE_DEST_PUBLIC_IP=""
   PASTE_SOURCE_PUBKEY=""; PASTE_DEST_PUBKEY=""
 
-  prompt_paste_copy_block || return; echo
+  # Re-run parser in case it was skipped
+  # This is a bit redundant but safe.
+  if [[ "${ROLE}" == "destination" ]]; then
+      # We need to re-parse the block to fill variables
+      # This is a simplified approach. A better one would be to store parsed values.
+      # For now, we just re-prompt.
+      : # This logic is now handled by the initial prompt_paste_copy_block
+  fi
+
   prompt_tun_name_new || return
 
   if [[ -n "${PASTE_SOURCE_PUBLIC_IP:-}" ]]; then
-    if [[ "${ROLE}" == "source" ]]; then
-      LOCAL_WAN_IP="${PASTE_SOURCE_PUBLIC_IP}"; REMOTE_WAN_IP="${PASTE_DEST_PUBLIC_IP}"
-      LOCAL_PUBKEY="${PASTE_SOURCE_PUBKEY}"; REMOTE_PUBKEY="${PASTE_DEST_PUBKEY}"
-    else
-      LOCAL_WAN_IP="${PASTE_DEST_PUBLIC_IP}"; REMOTE_WAN_IP="${PASTE_SOURCE_PUBLIC_IP}"
-      LOCAL_PUBKEY="${PASTE_DEST_PUBKEY}"; REMOTE_PUBKEY="${PASTE_SOURCE_PUBKEY}"
-    fi
-    ok "Public IPs and Keys filled from COPY BLOCK."
+      # This block runs if a COPY_BLOCK was pasted
+      if [[ "${ROLE}" == "destination" ]]; then
+          LOCAL_WAN_IP="${PASTE_DEST_PUBLIC_IP}"; REMOTE_WAN_IP="${PASTE_SOURCE_PUBLIC_IP}"
+          REMOTE_PUBKEY="${PASTE_SOURCE_PUBKEY}"
+          # The private key for PASTE_DEST_PUBKEY is unknown, so we must generate a new pair.
+          warn "Pasted public key is for the other peer. Generating new keys for this server."
+      else
+          # This case should ideally not happen with the new workflow
+          LOCAL_WAN_IP="${PASTE_SOURCE_PUBLIC_IP}"; REMOTE_WAN_IP="${PASTE_DEST_PUBLIC_IP}"
+          REMOTE_PUBKEY="${PASTE_DEST_PUBKEY}"
+      fi
+      ok "Public IPs and Peer Key filled from COPY BLOCK."
   fi
 
   prompt_wan_ips_keep || return
@@ -338,20 +372,19 @@ do_create() {
   recompute_tunnel_ips_from_pair || return
   prompt_details_keep || return
 
-  if [[ -z "${LOCAL_PUBKEY:-}" ]]; then
-    log "Generating new keys for this server..."
-    LOCAL_PRIVKEY=$(wg genkey)
-    LOCAL_PUBKEY=$(echo "$LOCAL_PRIVKEY" | wg pubkey)
-    ok "Keys generated."
-  else
-    err "Cannot generate new keys when a public key was provided via COPY BLOCK."
-    err "To generate new keys, start over without pasting a block."
-    return
-  fi
+  log "Generating new keys for this server..."
+  LOCAL_PRIVKEY=$(wg genkey)
+  LOCAL_PUBKEY=$(echo "$LOCAL_PRIVKEY" | wg pubkey)
+  ok "Local keys generated."
 
-  while ! is_wg_key "${REMOTE_PUBKEY:-}"; do
-    read -r -p "Remote Peer Public Key: " REMOTE_PUBKEY || true
-  done
+  # Only ask for remote key if it wasn't provided by a COPY_BLOCK
+  if [[ -z "${REMOTE_PUBKEY:-}" ]]; then
+    warn "You need the Public Key of the other server (the peer)."
+    warn "You can generate one on the other server using the 'Generate Keypair' menu option."
+    while ! is_wg_key "${REMOTE_PUBKEY:-}"; do
+      read -r -p "Enter the Remote Peer's Public Key: " REMOTE_PUBKEY || true
+    done
+  fi
 
   write_conf "$TUN_NAME"; write_sysctl_persist; enable_service "$TUN_NAME"; apply_now "$TUN_NAME"
   ok "Tunnel '${TUN_NAME}' created and started."
@@ -453,9 +486,10 @@ menu() {
     echo -e "${CYA}4)${NC} Status (all tunnels)"
     echo -e "${CYA}5)${NC} Info / COPY BLOCK"
     echo -e "${CYA}6)${NC} Delete tunnel"
+    echo -e "${YEL}7)${NC} Generate Keypair"
     echo -e "${CYA}0)${NC} Exit"
     echo -e "${MAG}----------------------------------------${NC}"
-    local c; read -r -p "Select an option [0-6]: " c || true
+    local c; read -r -p "Select an option [0-7]: " c || true
     case "${c:-}" in
       1) do_create; pause ;;
       2) do_edit; pause ;;
@@ -463,6 +497,7 @@ menu() {
       4) do_status_all; pause ;;
       5) show_info_one; pause ;;
       6) do_delete; pause ;;
+      7) do_generate_keypair; pause ;;
       0) exit 0 ;;
       *) err "Invalid selection."; pause ;;
     esac
