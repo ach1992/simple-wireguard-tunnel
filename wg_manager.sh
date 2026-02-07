@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # ==================================================
-#  Simple WireGuard Tunnel Manager (v5 - FIXED)
+#  Simple WireGuard Tunnel Manager
 #  Repo: https://github.com/ach1992/simple-wireguard-tunnel
 # ==================================================
 
