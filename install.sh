@@ -59,7 +59,6 @@ install_deps() {
   fi
 }
 
-# --- Patched Script Preparation Logic ---
 prepare_script() {
   mkdir -p "$TMP_DIR"
   
@@ -77,7 +76,6 @@ prepare_script() {
     return 0
   fi
 
-  # If not from a pipe, it's a local file.
   local script_path
   script_path=$( cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P )
   local local_manager_path="${script_path}/${SCRIPT_NAME}"
