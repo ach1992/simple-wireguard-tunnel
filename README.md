@@ -30,17 +30,12 @@ A simple, menu-driven Bash script to create and manage multiple **point-to-point
 
 ## Install & Run
 
-### 1. Online Install (Recommended)
+### 1. Online Install & Run (Recommended)
 
 Download and run the installer with one command. This ensures you get the latest version.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ach1992/simple-wireguard-tunnel/main/install.sh | sudo bash
-```
-
-After installation, run the manager:
-
-```bash
 sudo simple-wg
 ```
 
