@@ -172,16 +172,22 @@ recompute_tunnel_ips_from_pair() {
 
 # --- COPY BLOCK v2 ---
 print_copy_block() {
-  # in copy block, define ports per side (source listen and dest listen)
+  # In COPY BLOCK, labels are ALWAYS from the perspective of the source/destination roles (not "this server").
   local src_ip dst_ip src_pubkey dst_pubkey src_port dst_port
+  local src_privkey="" dst_privkey=""
+
   if [[ "${ROLE}" == "source" ]]; then
-    src_ip="${LOCAL_WAN_IP}"; dst_ip="${REMOTE_WAN_IP}"
+    src_ip="${LOCAL_WAN_IP}";  dst_ip="${REMOTE_WAN_IP}"
     src_pubkey="${LOCAL_PUBKEY}"; dst_pubkey="${REMOTE_PUBKEY}"
     src_port="${LOCAL_LISTEN_PORT}"; dst_port="${REMOTE_LISTEN_PORT}"
+    # if we generated keypair for the OTHER server (destination), include it
+    [[ -n "${REMOTE_PRIVKEY:-}" ]] && dst_privkey="${REMOTE_PRIVKEY}"
   else
     src_ip="${REMOTE_WAN_IP}"; dst_ip="${LOCAL_WAN_IP}"
     src_pubkey="${REMOTE_PUBKEY}"; dst_pubkey="${LOCAL_PUBKEY}"
     src_port="${REMOTE_LISTEN_PORT}"; dst_port="${LOCAL_LISTEN_PORT}"
+    # if we generated keypair for the OTHER server (source), include it
+    [[ -n "${REMOTE_PRIVKEY:-}" ]] && src_privkey="${REMOTE_PRIVKEY}"
   fi
 
   echo "----- SIMPLE_WG_COPY_BLOCK -----"
@@ -194,6 +200,17 @@ print_copy_block() {
   echo "DEST_LISTEN_PORT=${dst_port}"
   echo "TUN_NAME=${TUN_NAME}"
   echo "MTU=${MTU}"
+
+  # Optional (one-shot) private keys:
+  # WARNING: COPY BLOCK becomes sensitive if it contains a private key. Treat it like a password and delete it after use.
+  if [[ -n "${src_privkey:-}" ]]; then
+    echo "SOURCE_PRIVKEY=${src_privkey}"
+  fi
+  if [[ -n "${dst_privkey:-}" ]]; then
+    echo "DEST_PRIVKEY=${dst_privkey}"
+  fi
+
+  echo ""
   echo "----- END_COPY_BLOCK -----"
 }
 
@@ -223,6 +240,7 @@ prompt_paste_copy_block() {
   PASTE_SOURCE_PUBKEY=""; PASTE_DEST_PUBKEY=""
   PASTE_SOURCE_PORT=""; PASTE_DEST_PORT=""
   PASTE_TUN_NAME=""; PASTE_MTU=""
+  PASTE_SOURCE_PRIVKEY=""; PASTE_DEST_PRIVKEY=""
 
   for kv in "${lines[@]}"; do
     [[ "$kv" =~ ^[A-Z0-9_]+= ]] || continue
@@ -235,6 +253,8 @@ prompt_paste_copy_block() {
       DEST_PUBKEY)        PASTE_DEST_PUBKEY="$val" ;;
       SOURCE_LISTEN_PORT) PASTE_SOURCE_PORT="$val" ;;
       DEST_LISTEN_PORT)   PASTE_DEST_PORT="$val" ;;
+      SOURCE_PRIVKEY)     PASTE_SOURCE_PRIVKEY="$val" ;;
+      DEST_PRIVKEY)       PASTE_DEST_PRIVKEY="$val" ;;
       # backward compat:
       LISTEN_PORT)        PASTE_SOURCE_PORT="$val" ;;     # old block (assumes symmetric)
       ENDPOINT_PORT)      PASTE_SOURCE_PORT="$val" ;;
@@ -256,12 +276,24 @@ prompt_paste_copy_block() {
   is_wg_key "$PASTE_SOURCE_PUBKEY"  || { err "Pasted SOURCE_PUBKEY invalid."; return 1; }
   is_wg_key "$PASTE_DEST_PUBKEY"    || { err "Pasted DEST_PUBKEY invalid."; return 1; }
 
-  [[ -n "${PASTE_TUN_NAME:-}" ]] && ! is_ifname "$PASTE_TUN_NAME" && { err "Pasted TUN_NAME invalid."; return 1; }
-  [[ -n "${PASTE_SOURCE_PORT:-}" ]] && ! is_port "$PASTE_SOURCE_PORT" && { err "Pasted SOURCE_LISTEN_PORT invalid."; return 1; }
-  [[ -n "${PASTE_DEST_PORT:-}" ]] && ! is_port "$PASTE_DEST_PORT" && { err "Pasted DEST_LISTEN_PORT invalid."; return 1; }
-  [[ -n "${PASTE_MTU:-}" ]] && ! [[ "$PASTE_MTU" =~ ^[0-9]+$ ]] && { err "Pasted MTU must be numeric."; return 1; }
+  # optional private keys
+  if [[ -n "${PASTE_SOURCE_PRIVKEY:-}" ]]; then
+    is_wg_key "$PASTE_SOURCE_PRIVKEY" || { err "Pasted SOURCE_PRIVKEY invalid."; return 1; }
+  fi
+  if [[ -n "${PASTE_DEST_PRIVKEY:-}" ]]; then
+    is_wg_key "$PASTE_DEST_PRIVKEY" || { err "Pasted DEST_PRIVKEY invalid."; return 1; }
+  fi
 
-  ok "COPY BLOCK parsed successfully."
+  if [[ -n "${PASTE_SOURCE_PORT:-}" ]]; then
+    is_port "$PASTE_SOURCE_PORT" || { err "Pasted SOURCE_LISTEN_PORT invalid."; return 1; }
+  fi
+  if [[ -n "${PASTE_DEST_PORT:-}" ]]; then
+    is_port "$PASTE_DEST_PORT" || { err "Pasted DEST_LISTEN_PORT invalid."; return 1; }
+  fi
+  if [[ -n "${PASTE_MTU:-}" ]]; then
+    [[ "$PASTE_MTU" =~ ^[0-9]+$ ]] || { err "Pasted MTU invalid."; return 1; }
+  fi
+
   return 0
 }
 
@@ -381,6 +413,90 @@ stop_disable_service() {
   systemctl stop "$(service_for "$1")" >/dev/null 2>&1 || true
   systemctl disable "$(service_for "$1")" >/dev/null 2>&1 || true
 }
+# --- Firewall helpers (best-effort) ---
+# Opens/closes the local WireGuard UDP listen port on common firewalls.
+# Supported: ufw, firewalld, iptables, nftables (best-effort).
+fw_has_ufw() { command -v ufw >/dev/null 2>&1 && ufw status >/dev/null 2>&1; }
+fw_has_firewalld() { command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; }
+fw_has_iptables() { command -v iptables >/dev/null 2>&1; }
+fw_has_nft() { command -v nft >/dev/null 2>&1; }
+
+fw_open_udp_port() {
+  local port="$1" tag="${2:-simple-wg}"
+  [[ -z "${port:-}" ]] && return 0
+
+  # UFW
+  if fw_has_ufw; then
+    ufw allow "${port}/udp" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  # firewalld
+  if fw_has_firewalld; then
+    firewall-cmd --permanent --add-port="${port}/udp" >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  # iptables (insert at top of INPUT)
+  if fw_has_iptables; then
+    iptables -C INPUT -p udp --dport "$port" -j ACCEPT >/dev/null 2>&1 || \
+      iptables -I INPUT 1 -p udp --dport "$port" -j ACCEPT >/dev/null 2>&1 || true
+    command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  # nftables (best-effort)
+  if fw_has_nft; then
+    # Try adding to inet filter input (common default). Add a comment to remove later.
+    nft add rule inet filter input udp dport "$port" accept comment "${tag}:${port}" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  return 0
+}
+
+fw_close_udp_port() {
+  local port="$1" tag="${2:-simple-wg}"
+  [[ -z "${port:-}" ]] && return 0
+
+  # UFW
+  if fw_has_ufw; then
+    # 'ufw delete allow' is interactive sometimes; force non-interactive via yes.
+    yes | ufw delete allow "${port}/udp" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  # firewalld
+  if fw_has_firewalld; then
+    firewall-cmd --permanent --remove-port="${port}/udp" >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  # iptables
+  if fw_has_iptables; then
+    iptables -D INPUT -p udp --dport "$port" -j ACCEPT >/dev/null 2>&1 || true
+    command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  # nftables: remove rules that match our comment "${tag}:${port}"
+  if fw_has_nft; then
+    # Extract handles for matching rules and delete them.
+    local handles
+    handles="$(nft -a list chain inet filter input 2>/dev/null | awk -v pat="comment \\\""${tag}:${port}"\\\"" '$0 ~ pat {for(i=1;i<=NF;i++) if($i=="handle"){print $(i+1)}}')"
+    if [[ -n "${handles:-}" ]]; then
+      while IFS= read -r h; do
+        [[ -n "${h:-}" ]] && nft delete rule inet filter input handle "$h" >/dev/null 2>&1 || true
+      done <<< "$handles"
+    fi
+    return 0
+  fi
+
+  return 0
+}
+
 
 # --- Prompts ---
 prompt_role() {
@@ -544,12 +660,14 @@ do_create() {
   echo
 
   # defaults
+  COPY_BLOCK_DETECTED=0
   MTU="1420"
   PAIR_CODE=""
   LOCAL_WAN_IP=""
   REMOTE_WAN_IP=""
   REMOTE_PUBKEY=""
   REMOTE_LISTEN_PORT=""
+  REMOTE_PRIVKEY=""
   LOCAL_LISTEN_PORT=""
   TUN_NAME=""
 
@@ -575,6 +693,11 @@ do_create() {
 
     # map IPs and keys based on our role
     if [[ "$ROLE" == "source" ]]; then
+      # If COPY BLOCK contains our private key, use it (prevents auto-regeneration mismatch)
+      if [[ -n "${PASTE_SOURCE_PRIVKEY:-}" ]]; then
+        LOCAL_PRIVKEY="$PASTE_SOURCE_PRIVKEY"
+        LOCAL_PUBKEY="$(echo "$LOCAL_PRIVKEY" | wg pubkey)"
+      fi
       LOCAL_WAN_IP="$PASTE_SOURCE_PUBLIC_IP"
       REMOTE_WAN_IP="$PASTE_DEST_PUBLIC_IP"
       REMOTE_PUBKEY="$PASTE_DEST_PUBKEY"
@@ -585,6 +708,11 @@ do_create() {
         REMOTE_LISTEN_PORT="$PASTE_SOURCE_PORT"
       fi
     else
+      # If COPY BLOCK contains our private key, use it (prevents auto-regeneration mismatch)
+      if [[ -n "${PASTE_DEST_PRIVKEY:-}" ]]; then
+        LOCAL_PRIVKEY="$PASTE_DEST_PRIVKEY"
+        LOCAL_PUBKEY="$(echo "$LOCAL_PRIVKEY" | wg pubkey)"
+      fi
       LOCAL_WAN_IP="$PASTE_DEST_PUBLIC_IP"
       REMOTE_WAN_IP="$PASTE_SOURCE_PUBLIC_IP"
       REMOTE_PUBKEY="$PASTE_SOURCE_PUBKEY"
@@ -635,17 +763,40 @@ do_create() {
   # MTU
   prompt_mtu || return 1
 
-  # generate local keys
-  log "Generating new keys for this server..."
-  LOCAL_PRIVKEY=$(wg genkey)
-  LOCAL_PUBKEY=$(echo "$LOCAL_PRIVKEY" | wg pubkey)
-  ok "Local keys generated."
+  # local keys:
+  # - If COPY BLOCK provided our PrivateKey, use it (no regeneration).
+  # - Otherwise generate new keys.
+  if [[ -n "${LOCAL_PRIVKEY:-}" ]]; then
+    ok "Local PrivateKey loaded from COPY BLOCK (no regeneration)."
+    LOCAL_PUBKEY="$(echo "$LOCAL_PRIVKEY" | wg pubkey)"
+    # Verify against COPY BLOCK (if present)
+    if (( COPY_BLOCK_DETECTED )); then
+      if [[ "$ROLE" == "source" ]]; then
+        [[ "$LOCAL_PUBKEY" == "$PASTE_SOURCE_PUBKEY" ]] || { err "Local key mismatch: computed PublicKey != SOURCE_PUBKEY from COPY BLOCK."; return 1; }
+      else
+        [[ "$LOCAL_PUBKEY" == "$PASTE_DEST_PUBKEY" ]] || { err "Local key mismatch: computed PublicKey != DEST_PUBKEY from COPY BLOCK."; return 1; }
+      fi
+    fi
+  else
+    log "Generating new keys for this server..."
+    LOCAL_PRIVKEY=$(wg genkey)
+    LOCAL_PUBKEY=$(echo "$LOCAL_PRIVKEY" | wg pubkey)
+    ok "Local keys generated."
+  fi
 
   # remote pubkey (locked if copy block)
   if (( REMOTE_KEY_LOCKED )); then
     ok "Remote Public Key locked from COPY BLOCK."
   else
-    prompt_remote_pubkey_manual || return 1
+    # One-shot option: generate keypair for the OTHER server and include its PrivateKey inside the COPY BLOCK.
+    # This allows the second server to fully configure itself from the COPY BLOCK without manual key pasting.
+    if prompt_yesno "One-shot: generate keypair for the OTHER server and include its PrivateKey inside the COPY BLOCK? (Sensitive)"; then
+      REMOTE_PRIVKEY="$(wg genkey)"
+      REMOTE_PUBKEY="$(echo "$REMOTE_PRIVKEY" | wg pubkey)"
+      ok "Generated keypair for the other server. (COPY BLOCK will include its PrivateKey — keep it safe.)"
+    else
+      prompt_remote_pubkey_manual || return 1
+    fi
   fi
 
   # remote endpoint port (editable unless explicitly provided)
@@ -670,6 +821,9 @@ do_create() {
   enable_service "$TUN_NAME"
   apply_now "$TUN_NAME"
 
+  # Open local UDP port in firewall (best-effort)
+  fw_open_udp_port "$LOCAL_LISTEN_PORT" "simple-wg:$TUN_NAME"
+
   ok "Tunnel '${TUN_NAME}' created and started."
   echo
   show_info_one "$TUN_NAME"
@@ -679,6 +833,8 @@ do_edit() {
   if ! choose_tunnel; then warn "No tunnels to edit."; return 0; fi
   local old_tun="$SELECTED_TUN"
   read_meta "$old_tun" || { err "Could not read config for $old_tun"; return 1; }
+
+  local OLD_LOCAL_LISTEN_PORT="${LOCAL_LISTEN_PORT:-}"
 
   log "Editing tunnel: $old_tun"
   warn "Press Enter to keep current values."
@@ -728,6 +884,13 @@ do_edit() {
   ensure_ip_forwarding_managed
   enable_service "$TUN_NAME"
   apply_now "$TUN_NAME"
+
+  # Firewall updates (best-effort)
+  fw_open_udp_port "$LOCAL_LISTEN_PORT" "simple-wg:$TUN_NAME"
+  if [[ -n "${OLD_LOCAL_LISTEN_PORT:-}" ]] && [[ "$OLD_LOCAL_LISTEN_PORT" != "$LOCAL_LISTEN_PORT" ]]; then
+    fw_close_udp_port "$OLD_LOCAL_LISTEN_PORT" "simple-wg:$old_tun"
+  fi
+
   ok "Tunnel '${TUN_NAME}' updated and applied."
   echo
   show_info_one "$TUN_NAME"
@@ -867,8 +1030,14 @@ do_delete() {
   local yn; read -r -p "Are you sure? [y/N]: " yn || true
   [[ ! "$yn" =~ ^([yY])$ ]] && { log "Canceled."; return 0; }
 
+  # Close firewall port (best-effort) before removing config
+  local f port
+  f="$(conf_path_for "$tun")"
+  port="$(awk -F' = ' '/^[[:space:]]*ListenPort[[:space:]]*=/{print $2; exit}' "$f" 2>/dev/null || true)"
+  [[ -n "${port:-}" ]] && fw_close_udp_port "$port" "simple-wg:$tun"
+
   stop_disable_service "$tun"
-  rm -f "$(conf_path_for "$tun")" || true
+  rm -f "$f" || true
   ok "Deleted tunnel '$tun'."
   restore_ip_forwarding_if_last_tunnel
 }
